@@ -1,0 +1,337 @@
+# Linguistic Complexity Analysis
+# Using textstat library for Flesch-Kincaid calculation
+
+import time
+import json
+import pandas as pd
+import numpy as np
+import spacy
+import textstat
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from collections import Counter
+import warnings
+import gc
+import math
+from tqdm import tqdm
+
+warnings.filterwarnings('ignore')
+start_time = time.time()
+
+# Initialize spaCy model
+nlp = spacy.load("en_core_web_md")
+nlp.disable_pipes("ner")
+nlp.max_length = 10000000
+
+# REMOVED: count_syllables function - no longer needed
+
+def get_parse_depth(token):
+    """Calculate syntactic parse tree depth for a token."""
+    depth = 0
+    current = token
+    visited = set()
+    
+    while current.head != current and current not in visited:
+        visited.add(current)
+        depth += 1
+        current = current.head
+        if depth > 50:
+            break
+    return depth
+
+def safe_divide(numerator, denominator):
+    """Safe division that handles zero denominators."""
+    return numerator / denominator if denominator > 0 else 0
+
+def get_spacy_word_count(doc):
+    """Get standardized spaCy word count - consistent with other analyses."""
+    return len([token for token in doc if token.is_alpha])
+
+def calculate_length_normalized_metrics(doc):
+    """Calculate basic length metrics using consistent spaCy standards."""
+    spacy_word_count = get_spacy_word_count(doc)
+    sentences = list(doc.sents)
+    sentence_count = len(sentences)
+    
+    return {
+        'spacy_word_count': spacy_word_count,
+        'sentence_count': sentence_count,
+        'avg_words_per_sentence': safe_divide(spacy_word_count, sentence_count)
+    }
+
+# LEXICAL METRICS
+def calculate_lexical_metrics(doc, tokens):
+    """Calculate lexical diversity metrics properly normalized for speech length."""
+    if not tokens or len(tokens) < 2:
+        return {
+            'ttr': 0, 'mattr': 0, 'vocab_size': 0,
+            'avg_word_length': 0
+        }
+    
+    unique_tokens = set(tokens)
+    vocab_size = len(unique_tokens)
+    token_count = len(tokens)
+    
+    ttr = safe_divide(vocab_size, token_count)
+    
+    mattr = ttr
+    if token_count >= 100:
+        window_size = min(100, token_count // 4)
+        ttr_values = []
+        
+        step_size = max(1, window_size // 10)
+        for i in range(0, token_count - window_size + 1, step_size):
+            window = tokens[i:i + window_size]
+            window_ttr = safe_divide(len(set(window)), len(window))
+            ttr_values.append(window_ttr)
+        
+        mattr = np.mean(ttr_values) if ttr_values else ttr
+    
+    avg_word_length = np.mean([len(token) for token in tokens])
+    
+    return {
+        'ttr': ttr,
+        'mattr': mattr,
+        'vocab_size': vocab_size,
+        'avg_word_length': avg_word_length
+    }
+
+# SEMANTIC METRICS
+def calculate_semantic_metrics(doc):
+    """Calculate semantic sophistication metrics using ALL content words from the speech."""
+    content_tokens = [token for token in doc if token.is_alpha and not token.is_stop 
+                     and token.has_vector and len(token.text) > 2]
+    
+    if len(content_tokens) < 10:
+        return {
+            'avg_cosine_distance': 0, 'vector_space_density': 0,
+            'semantic_clustering_coef': 0, 'lexical_sophistication_index': 0
+        }
+    
+    vectors = np.array([token.vector for token in content_tokens])
+    
+    if len(vectors) > 1000:
+        n_sections = 10
+        section_size = len(vectors) // n_sections
+        sample_indices = []
+        
+        for i in range(n_sections):
+            start_idx = i * section_size
+            end_idx = (i + 1) * section_size if i < n_sections - 1 else len(vectors)
+            section_sample_size = min(30, end_idx - start_idx)
+            
+            if section_sample_size > 0:
+                section_indices = np.random.choice(
+                    range(start_idx, end_idx), 
+                    section_sample_size, 
+                    replace=False
+                )
+                sample_indices.extend(section_indices)
+        
+        sample_vectors = vectors[sample_indices]
+    else:
+        sample_vectors = vectors
+
+    if len(sample_vectors) > 1:
+        cosine_sim_matrix = cosine_similarity(sample_vectors)
+        upper_triangle = cosine_sim_matrix[np.triu_indices_from(cosine_sim_matrix, k=1)]
+        avg_cosine_distance = 1 - np.mean(upper_triangle)
+    else:
+        avg_cosine_distance = 0
+    
+    # IMPROVED vector space density calculation
+    centroid = np.mean(vectors, axis=0)
+    distances_to_centroid = np.linalg.norm(vectors - centroid, axis=1)
+    mean_distance = np.mean(distances_to_centroid)
+    # Use inverse distance ratio instead of arbitrary sqrt normalization
+    vector_space_density = 1 / (1 + mean_distance)
+    
+    # IMPROVED semantic clustering with adaptive minimum
+    semantic_clustering_coef = 0
+    min_tokens_for_clustering = max(10, int(len(vectors) * 0.1))  # Adaptive minimum
+    
+    if len(vectors) >= min_tokens_for_clustering:
+        try:
+            n_clusters = min(max(2, int(np.sqrt(len(vectors)))), 10)
+            
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(vectors)
+            
+            if len(set(cluster_labels)) > 1:
+                silhouette_avg = silhouette_score(vectors, cluster_labels)
+                semantic_clustering_coef = max(0, silhouette_avg)
+        except Exception:
+            semantic_clustering_coef = 0
+
+    hapax_legomena = sum(1 for count in Counter([token.text.lower() for token in content_tokens]).values() if count == 1)
+    unique_words = len(set([token.text.lower() for token in content_tokens]))
+    rare_word_ratio = safe_divide(hapax_legomena, unique_words)
+    
+    avg_vector_norm = np.mean(np.linalg.norm(vectors, axis=1))
+    normalized_vector_norm = min(1.0, avg_vector_norm / 3.0)
+    
+    lexical_sophistication_index = (rare_word_ratio + normalized_vector_norm) / 2
+    
+    return {
+        'avg_cosine_distance': avg_cosine_distance,
+        'vector_space_density': vector_space_density,
+        'semantic_clustering_coef': semantic_clustering_coef,
+        'lexical_sophistication_index': lexical_sophistication_index
+    }
+
+# SYNTACTIC METRICS (Using textstat for Flesch-Kincaid)
+def calculate_syntactic_metrics(doc, avg_words_per_sentence, original_text):
+    """Calculate syntactic complexity metrics properly normalized."""
+    sentences = list(doc.sents)
+    if not sentences:
+        return {
+            'clauses_per_sentence': 0,
+            'parse_tree_depth': 0, 'mean_dependency_distance': 0,
+            'flesch_kincaid_grade': 0
+        }
+    
+    clause_labels = {'ROOT', 'ccomp', 'xcomp', 'advcl', 'acl', 'relcl', 'conj'}
+    clause_counts = []
+    for sent in sentences:
+        clause_count = sum(1 for token in sent if token.dep_ in clause_labels)
+        clause_counts.append(max(1, clause_count))
+    
+    clauses_per_sent = np.mean(clause_counts) if clause_counts else 1
+    
+    normalized_depths = []
+    for sent in sentences:
+        sent_tokens = [t for t in sent if t.is_alpha]
+        if not sent_tokens:
+            continue
+            
+        depths = [get_parse_depth(token) for token in sent_tokens]
+        max_depth = max(depths) if depths else 0
+        normalized_depth = safe_divide(max_depth, len(sent_tokens))
+        normalized_depths.append(normalized_depth)
+    
+    parse_depth = np.mean(normalized_depths) if normalized_depths else 0
+    
+    normalized_distances = []
+    for sent in sentences:
+        sent_tokens = list(sent)
+        if len(sent_tokens) <= 1:
+            continue
+        
+        distances = []
+        for i, token in enumerate(sent_tokens):
+            if token.head != token:
+                head_idx = None
+                for j, head_candidate in enumerate(sent_tokens):
+                    if head_candidate == token.head:
+                        head_idx = j
+                        break
+                
+                if head_idx is not None:
+                    raw_distance = abs(i - head_idx)
+                    normalized_distance = safe_divide(raw_distance, len(sent_tokens))
+                    distances.append(normalized_distance)
+        
+        if distances:
+            normalized_distances.append(np.mean(distances))
+    
+    dep_distance = np.mean(normalized_distances) if normalized_distances else 0
+    
+    # Use textstat for Flesch-Kincaid calculation
+    try:
+        fk_grade = textstat.flesch_kincaid().grade(original_text)
+        fk_grade = max(0, fk_grade)
+    except Exception:
+        fk_grade = 0
+    
+    return {
+        'clauses_per_sentence': clauses_per_sent,
+        'parse_tree_depth': parse_depth,
+        'mean_dependency_distance': dep_distance,
+        'flesch_kincaid_grade': fk_grade
+    }
+
+
+# MAIN ANALYSIS FUNCTION
+def analyze_speeches_complete(speeches_data):
+    """Complete analysis with normalized metrics."""
+    results = []
+    
+    for speech in tqdm(speeches_data, desc="Analyzing speeches"):
+        try:
+            doc = nlp(speech['content'])
+            
+            length_metrics = calculate_length_normalized_metrics(doc)
+            spacy_word_count = length_metrics['spacy_word_count']
+            
+            if spacy_word_count < 10:
+                continue
+            
+            tokens = [token.text.lower() for token in doc if token.is_alpha]
+            
+            lexical_metrics = calculate_lexical_metrics(doc, tokens)
+            semantic_metrics = calculate_semantic_metrics(doc)
+            syntactic_metrics = calculate_syntactic_metrics(doc, length_metrics['avg_words_per_sentence'], speech['content'])
+            
+            result = {
+                'speech_id': speech['speech_id'],
+                **length_metrics,
+                **lexical_metrics,
+                **semantic_metrics,
+                **syntactic_metrics
+            }
+            
+            results.append(result)
+            
+        except Exception as e:
+            default_result = {
+                'speech_id': speech['speech_id'],
+                'spacy_word_count': np.nan, 'sentence_count': np.nan, 'avg_words_per_sentence': np.nan,
+                'ttr': np.nan, 'mattr': np.nan, 'vocab_size': np.nan,
+                'avg_word_length': np.nan, 'avg_cosine_distance': np.nan,
+                'vector_space_density': np.nan, 'semantic_clustering_coef': np.nan,
+                'lexical_sophistication_index': np.nan, 'clauses_per_sentence': np.nan,
+                'parse_tree_depth': np.nan, 'mean_dependency_distance': np.nan, 
+                'flesch_kincaid_grade': np.nan
+            }
+            results.append(default_result)
+        
+        gc.collect()
+    
+    return pd.DataFrame(results)
+
+# MAIN EXECUTION
+if __name__ == "__main__":
+    input_file = "Parliamentary_Speeches.json"
+    
+    with open(input_file, 'r', encoding='utf-8') as f:
+        speeches = json.load(f)
+    
+    df = analyze_speeches_complete(speeches)
+    
+    output_file = f"linguistic_analysis_{len(df)}_speeches.csv"
+    df.to_csv(output_file, index=False)
+    
+    total_time = time.time() - start_time
+    
+    print(f"\nAnalysis completed in {total_time/60:.1f} minutes")
+    print(f"Analyzed {len(df)} speeches")
+    print(f"Results saved to: {output_file}")
+    
+    metric_categories = {
+        'Length Measures': ['spacy_word_count', 'sentence_count', 'avg_words_per_sentence'],
+        'Lexical': ['ttr', 'mattr', 'vocab_size', 'avg_word_length'],
+        'Semantic': ['avg_cosine_distance', 'vector_space_density', 'semantic_clustering_coef', 'lexical_sophistication_index'],
+        'Syntactic': ['clauses_per_sentence', 'parse_tree_depth', 'mean_dependency_distance', 'flesch_kincaid_grade']
+    }
+    
+    print("\nSummary Statistics:")
+    for category, metrics in metric_categories.items():
+        print(f"\n{category}:")
+        for metric in metrics:
+            if metric in df.columns:
+                mean_val = df[metric].mean()
+                std_val = df[metric].std()
+                print(f"  {metric}: {mean_val:.3f} ± {std_val:.3f}")
+    
+    print("\nAnalysis complete")

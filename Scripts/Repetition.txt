@@ -1,0 +1,184 @@
+import re
+import json
+import math
+import csv
+from collections import Counter, defaultdict
+from typing import List, Dict
+import numpy as np
+from nltk import trigrams, bigrams
+import spacy
+from scipy.stats import linregress
+
+nlp = spacy.load("en_core_web_sm")
+nlp.max_length = 2_000_000
+
+input_file = "Presidential_Speeches.json"
+output_file = "ngram_metrics_summary_pres.csv"
+
+# Output files
+bigram_bundle_output_file = "lexical_bundles_bigrams_pres.csv"
+trigram_bundle_output_file = "lexical_bundles_trigrams_pres.csv"
+bigram_repeated_output_file = "repeated_bigrams_pres.csv"
+trigram_repeated_output_file = "repeated_trigrams_pres.csv"
+bigram_tiers_output_file = "bigram_tiers_pres.csv"
+trigram_tiers_output_file = "trigram_tiers_pres.csv"
+
+class NgramMetricsAnalyzer:
+    def __init__(self, text: str):
+        doc = nlp(text)
+        self.tokens = [token.text.lower() for token in doc if token.is_alpha]
+        self.total_words = len(self.tokens)
+        self.trigrams = list(trigrams(self.tokens))
+        self.bigrams = list(bigrams(self.tokens))
+        self.trigram_counts = Counter(self.trigrams)
+        self.bigram_counts = Counter(self.bigrams)
+
+        self.repeated_trigram_counts = [c for c in self.trigram_counts.values() if c >= 3]
+        self.repeated_bigram_counts = [c for c in self.bigram_counts.values() if c >= 3]
+
+    def repeated_ttr(self, ngrams: List[tuple]) -> float:
+        """TTR for ngrams that appear ≥3 times"""
+        if not ngrams:
+            return 0.0
+        counts = Counter(ngrams)
+        repeated = [k for k, v in counts.items() if v >= 3]
+        return len(repeated) / len(ngrams) * 100
+
+    def entropy(self, repeated_counts: List[int]) -> float:
+        if not repeated_counts:
+            return 0.0
+        total = sum(repeated_counts)
+        probs = [c / total for c in repeated_counts]
+        return -sum(p * math.log2(p) for p in probs if p > 0)
+
+    def zipf_slope(self, ngram_counts: Counter) -> float:
+        freqs = sorted(ngram_counts.values(), reverse=True)
+        if len(freqs) < 2:
+            return 0.0
+        ranks = np.arange(1, len(freqs) + 1)
+        log_ranks = np.log10(ranks)
+        log_freqs = np.log10(freqs)
+        slope, _, _, _, _ = linregress(log_ranks, log_freqs)
+        return slope
+
+    def repetition_density(self, ngram_list: List[tuple], ngram_counts: Counter, window_size: int = 100) -> float:
+        repeated_set = {ngram for ngram, count in ngram_counts.items() if count >= 3}
+        total_windows = 0
+        total_repeats = 0
+
+        for i in range(0, len(ngram_list) - window_size + 1):
+            window = ngram_list[i:i + window_size]
+            window_repeats = sum(1 for ngram in window if ngram in repeated_set)
+            total_repeats += window_repeats
+            total_windows += 1
+
+        return total_repeats / total_windows if total_windows > 0 else 0.0
+
+    def get_repeated_ngrams(self, ngram_counts: Counter, n: int = 3) -> Dict[str, int]:
+        return {
+            ' '.join(ngram): count
+            for ngram, count in ngram_counts.items()
+            if count >= n
+        }
+
+    def full_analysis(self) -> Dict[str, float]:
+        repeated_bigram_types = len([k for k, v in self.bigram_counts.items() if v >= 3])
+        repeated_trigram_types = len([k for k, v in self.trigram_counts.items() if v >= 3])
+
+        return {
+            "total_words": self.total_words,
+            "bigram_ttr_pct": self.repeated_ttr(self.bigrams),
+            "trigram_ttr_pct": self.repeated_ttr(self.trigrams),
+            "bigram_entropy_repetition": self.entropy(self.repeated_bigram_counts),
+            "trigram_entropy_repetition": self.entropy(self.repeated_trigram_counts),
+            "repeated_bigram_types": repeated_bigram_types,
+            "repeated_trigram_types": repeated_trigram_types,
+            "repeated_bigram_types_pct": (repeated_bigram_types / self.total_words) * 100 if self.total_words else 0.0,
+            "repeated_trigram_types_pct": (repeated_trigram_types / self.total_words) * 100 if self.total_words else 0.0,
+            "bigram_zipf_slope": self.zipf_slope(self.bigram_counts),
+            "trigram_zipf_slope": self.zipf_slope(self.trigram_counts),
+            "bigram_repetition_density_100w": self.repetition_density(self.bigrams, self.bigram_counts),
+            "trigram_repetition_density_100w": self.repetition_density(self.trigrams, self.trigram_counts)
+        }
+
+# === LOAD AND PROCESS ===
+with open(input_file, 'r', encoding='utf-8') as f:
+    speeches = json.load(f)
+
+all_data = []
+bigram_bundle_data = []
+trigram_bundle_data = []
+bigram_repeated_data = []
+trigram_repeated_data = []
+speech_level_bigram_counts = defaultdict(set)
+speech_level_trigram_counts = defaultdict(set)
+
+for item in speeches:
+    analyzer = NgramMetricsAnalyzer(item['content'])
+    metrics = analyzer.full_analysis()
+    metrics['speech_id'] = item['speech_id']
+    all_data.append(metrics)
+
+    repeated_bigrams = analyzer.get_repeated_ngrams(analyzer.bigram_counts)
+    repeated_trigrams = analyzer.get_repeated_ngrams(analyzer.trigram_counts)
+
+    for phrase, count in repeated_bigrams.items():
+        bigram_bundle_data.append({"speech_id": item['speech_id'], "bundle": phrase, "count": count})
+        bigram_repeated_data.append({"speech_id": item['speech_id'], "ngram": phrase, "count": count})
+        speech_level_bigram_counts[phrase].add(item['speech_id'])
+
+    for phrase, count in repeated_trigrams.items():
+        trigram_bundle_data.append({"speech_id": item['speech_id'], "bundle": phrase, "count": count})
+        trigram_repeated_data.append({"speech_id": item['speech_id'], "ngram": phrase, "count": count})
+        speech_level_trigram_counts[phrase].add(item['speech_id'])
+
+# === SAVE MAIN METRICS ===
+fieldnames = list(all_data[0].keys())
+with open(output_file, 'w', newline='', encoding='utf-8') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(all_data)
+
+# === SAVE LEXICAL BUNDLE DETAILS ===
+def write_bundle_file(filepath, data):
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=["speech_id", "bundle", "count"])
+        writer.writeheader()
+        writer.writerows(data)
+
+write_bundle_file(bigram_bundle_output_file, bigram_bundle_data)
+write_bundle_file(trigram_bundle_output_file, trigram_bundle_data)
+write_bundle_file(bigram_repeated_output_file, bigram_repeated_data)
+write_bundle_file(trigram_repeated_output_file, trigram_repeated_data)
+
+# === SAVE BUNDLE TIERS ===
+total_speeches = len(speeches)
+for counts_dict, output_path in [
+    (speech_level_bigram_counts, bigram_tiers_output_file),
+    (speech_level_trigram_counts, trigram_tiers_output_file)
+]:
+    tier_rows = []
+    for bundle, speech_ids in counts_dict.items():
+        speech_count = len(speech_ids)
+        pct = (speech_count / total_speeches) * 100
+        if pct >= 75:
+            tier = '≥75%'
+        elif pct >= 50:
+            tier = '≥50%'
+        elif pct >= 25:
+            tier = '≥25%'
+        elif pct >= 10:
+            tier = '≥10%'
+        else:
+            continue
+        tier_rows.append({
+            "bundle": bundle,
+            "speech_count": speech_count,
+            "total_speeches": total_speeches,
+            "speech_pct": round(pct, 2),
+            "tier": tier
+        })
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=["bundle", "speech_count", "total_speeches", "speech_pct", "tier"])
+        writer.writeheader()
+        writer.writerows(tier_rows)

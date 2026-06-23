@@ -1,0 +1,202 @@
+import json
+import pandas as pd
+import spacy
+import contractions
+from collections import Counter
+from tqdm.notebook import tqdm
+from datetime import datetime
+
+# Load spaCy model
+nlp = spacy.load("en_core_web_sm")
+nlp.max_length = 2_000_000
+
+# Define pronoun categories
+pronoun_categories = {
+    'first_singular': ['i', 'me', 'my', 'mine', 'myself'],
+    'first_plural': ['our', 'ours', 'ourselves', 'us', 'we'],
+    'second_person': ['you', 'your', 'yours', 'yourself', 'yourselves'],
+    'third_singular': ['he', 'him', 'she', 'her', 'hers', 'herself', 'his', 'himself', 'oneself'],
+    'third_plural': ['they', 'them', 'their', 'theirs', 'themself', 'themselves']
+}
+
+# Pronoun frame mapping
+pronoun_frame_map = {
+    'first_singular': 'individual',
+    'first_plural': 'collective'
+}
+
+# Verb tags
+VERB_TAGS = ["VB", "VBD", "VBG", "VBN", "VBP", "VBZ"]
+
+def normalize_nonstandard_contractions(text):
+    replacements = {
+        "lets": "let us", "weve": "we have", "youd": "you would", "youll": "you will", "youre": "you are",
+        "youve": "you have", "hes": "he is", "shes": "she is", "theyd": "they would", "theyll": "they will",
+        "theyve": "they have", "hisself": "himself", "hisselves": "themselves",
+        "theirself": "themselves", "theirselves": "themselves"
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text
+
+def get_pronoun_category(token):
+    text = token.text.lower()
+    for category, pronouns in pronoun_categories.items():
+        if text in pronouns:
+            return category
+    return None
+
+def get_possessive_determiner_category(token):
+    text = token.text.lower()
+    if text in ['my']:
+        return 'first_singular'
+    elif text in ['our']:
+        return 'first_plural'
+    elif text in ['your']:
+        return 'second_person'
+    elif text in ['his', 'her', 'its']:
+        return 'third_singular'
+    elif text in ['their']:
+        return 'third_plural'
+    return None
+
+# Load speeches
+json_path = "/content/Parliamentary_Speeches.json"
+with open(json_path, "r", encoding="utf-8") as f:
+    speeches = json.load(f)
+
+results = []
+
+for speech in tqdm(speeches, desc="Analyzing Speeches"):
+    speech_id = speech.get("speech_id")
+    raw_text = speech.get("content", "")
+    text = contractions.fix(raw_text)
+    text = normalize_nonstandard_contractions(text)
+    doc = nlp(text)
+
+    word_count = len([t for t in doc if t.is_alpha])
+    sent_count = len(list(doc.sents))
+
+    category_counts = Counter()
+    shift_count = 0
+    individual_to_collective = 0
+    collective_to_individual = 0
+    previous_type = None
+    pronoun_verb_pairs = 0
+
+    # New: initialize verb frame counts
+    verb_frame_counts = {
+        'individual_past': 0,
+        'individual_present': 0,
+        'individual_future': 0,
+        'collective_past': 0,
+        'collective_present': 0,
+        'collective_future': 0
+    }
+
+    for sent in doc.sents:
+        for i, token in enumerate(sent):
+            if token.pos_ == "PRON" and token.dep_ in ["nsubj", "nsubjpass"]:
+                category = get_pronoun_category(token)
+                if category:
+                    category_counts[category] += 1
+                    current_type = pronoun_frame_map.get(category)
+
+                    # Detect frame shift
+                    if current_type:
+                        if previous_type and current_type != previous_type:
+                            shift_count += 1
+                            if previous_type == 'individual' and current_type == 'collective':
+                                individual_to_collective += 1
+                            elif previous_type == 'collective' and current_type == 'individual':
+                                collective_to_individual += 1
+                        previous_type = current_type
+
+                    # Check for verb collocations and categorize
+                    if i + 1 < len(sent) and sent[i + 1].text.lower() == "will":
+                        if i + 2 < len(sent) and sent[i + 2].tag_ in VERB_TAGS:
+                            if current_type == "individual":
+                                verb_frame_counts["individual_future"] += 1
+                            elif current_type == "collective":
+                                verb_frame_counts["collective_future"] += 1
+                            pronoun_verb_pairs += 1
+                    elif i + 1 < len(sent) and sent[i + 1].tag_ in VERB_TAGS:
+                        verb_tag = sent[i + 1].tag_
+                        if current_type == "individual":
+                            if verb_tag in ["VBD", "VBN"]:
+                                verb_frame_counts["individual_past"] += 1
+                            elif verb_tag in ["VBG", "VBZ", "VBP"]:
+                                verb_frame_counts["individual_present"] += 1
+                        elif current_type == "collective":
+                            if verb_tag in ["VBD", "VBN"]:
+                                verb_frame_counts["collective_past"] += 1
+                            elif verb_tag in ["VBG", "VBZ", "VBP"]:
+                                verb_frame_counts["collective_present"] += 1
+                        pronoun_verb_pairs += 1
+
+            elif token.tag_ == "PRP$":
+                category = get_possessive_determiner_category(token)
+                if category:
+                    category_counts[category] += 1
+                    current_type = pronoun_frame_map.get(category)
+                    if current_type:
+                        if previous_type and current_type != previous_type:
+                            shift_count += 1
+                            if previous_type == 'individual' and current_type == 'collective':
+                                individual_to_collective += 1
+                            elif previous_type == 'collective' and current_type == 'individual':
+                                collective_to_individual += 1
+                        previous_type = current_type
+
+    shift_rate = (shift_count / sent_count) if sent_count else 0
+    shift_rate_percentage = shift_rate * 100
+    pronoun_verb_percentage = (pronoun_verb_pairs / word_count) * 100 if word_count else 0
+
+    # === FINAL RESULT ===
+    result = {
+        "speech_id": speech_id,
+        "total_words": word_count,
+        "total_sentences": sent_count,
+        "pronoun_shifts": shift_count,
+        "shift_rate": shift_rate,
+        "shift_rate_percentage": shift_rate_percentage,
+        "individual_to_collective": individual_to_collective,
+        "collective_to_individual": collective_to_individual,
+        "individual_to_collective_per_100_sent": (individual_to_collective / sent_count) * 100 if sent_count else 0,
+        "collective_to_individual_per_100_sent": (collective_to_individual / sent_count) * 100 if sent_count else 0,
+        "total_pronoun_verb_pairs": pronoun_verb_pairs,
+        "pronoun_verb_percentage": pronoun_verb_percentage,
+
+        # New metrics - raw counts
+        "individual_past": verb_frame_counts["individual_past"],
+        "individual_present": verb_frame_counts["individual_present"],
+        "individual_future": verb_frame_counts["individual_future"],
+        "collective_past": verb_frame_counts["collective_past"],
+        "collective_present": verb_frame_counts["collective_present"],
+        "collective_future": verb_frame_counts["collective_future"],
+
+        # New metrics - normalized percentages
+        "individual_past_percentage": (verb_frame_counts["individual_past"] / word_count) * 100 if word_count else 0,
+        "individual_present_percentage": (verb_frame_counts["individual_present"] / word_count) * 100 if word_count else 0,
+        "individual_future_percentage": (verb_frame_counts["individual_future"] / word_count) * 100 if word_count else 0,
+        "collective_past_percentage": (verb_frame_counts["collective_past"] / word_count) * 100 if word_count else 0,
+        "collective_present_percentage": (verb_frame_counts["collective_present"] / word_count) * 100 if word_count else 0,
+        "collective_future_percentage": (verb_frame_counts["collective_future"] / word_count) * 100 if word_count else 0
+    }
+
+    # Add pronoun category counts + percentages
+    for category in pronoun_categories:
+        count = category_counts[category]
+        result[category] = count
+        result[f"{category}_percentage"] = (count / word_count) * 100 if word_count else 0
+
+    results.append(result)
+
+# Save output
+output_path = "/content/speech_pronoun_split_analysis_parl.csv"
+pd.DataFrame(results).to_csv(output_path, index=False)
+print("Analysis complete. Output saved to:", output_path)
+
+# Optional: download in Colab
+from google.colab import files
+files.download(output_path)

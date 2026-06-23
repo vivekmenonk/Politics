@@ -1,0 +1,211 @@
+from bertopic import BERTopic
+from sklearn.feature_extraction.text import CountVectorizer
+from tqdm import tqdm
+import json
+import pandas as pd
+from datetime import datetime
+import matplotlib.pyplot as plt
+import re
+import spacy
+from umap import UMAP
+import numpy as np
+import random
+import os
+
+# SET RANDOM SEEDS FOR REPRODUCIBILITY
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+
+# Load spaCy model
+nlp = spacy.load("en_core_web_sm")
+nlp.max_length = 2_000_000
+
+# Load data
+with open("Presidential_Speeches_with_dates.json", "r", encoding="utf-8") as f:
+    pres_data = json.load(f)
+with open("Parliamentary_Speeches_with_dates.json", "r", encoding="utf-8") as f:
+    parl_data = json.load(f)
+
+# Text cleaning with noise and NER filtering
+def clean_text(text):
+    noise_patterns = [
+        # Original patterns
+        r'\b(applause|laughter|cheers|clapping|thank you|ladies and gentlemen|your excellency)\b',
+        r'\b(welcome|pleased to|honor to|begin by|let me|conclude|in closing|god bless)\b',
+        r'\b(happy|merry|new year|festival|celebrate|easter|eid|diwali|ramadan|republic day)\b',
+        r'\b(because|that\'s why|you know|we have to|i think|uh|um)\b',
+        r'\b(nonenglish|brazil|bharat|ji|indonesia|african)\b',
+        r'(press statement by president joko widodo|greetings from president joko widodo|remarks by president joko widodo|speech by president joko widodo|president joko widodo s statement|transcript of president joko widodo s|address by president joko widodo|republic of kenya press statement|republic of kenya remarks)',
+        r'\b(britain|uk|eu|canada|canadians|australia|australian|seychelles|seychellois|netanyahu|ruto|william|commanderinchief)\b',
+        r'\b(hon|ble|mr speaker|madam speaker|speaker|national assembly|assembly|parliament|parliamentary|hon member|honourable|minister|deputy minister)\b',
+        r'\b(going|i am|i will|i have|we are|we will|we have|this is|that is|it is)\b',
+        r'\b(order|point of order|question|questions|motion|bill|act|clause|section|amendment)\b',
+        r'\b(nonenglish|joko widodo|republic joko|widodo|greet dear|like greet)\b',
+        r'\b(brazilian|burma|aung|la les des|et en der du|tata|000d|tni nonenglish)\b',
+        r'\b(africa 000|commanderinchief|theyre america weve|stoltenberg|bondevik)\b',
+        r'\b(solberg|kjell magne|hon ble|mr speaker|speaker|assembly)\b',
+        r'\b(going|said|think|know|time|way|make|take|get|give|work|help)\b',
+        r'\b(order|question|motion|bill|act|clause|member|minister|deputy)\b',
+        r'\b(thank|thanks|welcome|pleased|honor|begin|conclude|closing)\b',
+        r'\b(ram|lord|sisters|saints|guardian|muhammadiyah|siti|maria|ikn)\b',
+        
+        # Additional patterns to filter out topics that ranked higher than our Top 10
+        # Personal Names/Officials (high-ranking noisy topics)
+        r'\b(trump|obama|nato|relationship|barack|david)\b',  
+        r'\b(widodo|joko|rice|journalist|republic|yes|sake)\b',  
+        r'\b(solberg|erna|war|preparedness|office|outdoor|oil|competence)\b',  
+        r'\b(stoltenberg|jens|party|unemployment|kroner|july)\b',  
+        r'\b(gandhi|mahatma|gandhiji|satyagraha|communal)\b',  
+        r'\b(modi|baat|mann|ki|countrymen)\b',  
+        r'\b(bondevik|kjell|welfare|kr|storting)\b',  
+        r'\b(jugnauth|pravind|hrs|kumar|mauritius)\b', 
+        
+        # Country/Region-Specific (high-ranking noisy topics)
+        r'\b(australians|indigenous|labor|sydney|commonwealth|alliance|tonight|immigration)\b', 
+        r'\b(sisters|brothers|friends|projects|railway|railways|dki|lrt|governor|transportation)\b',  
+        r'\b(respected|tni|rp|nation|republic|language|rodrigues|languages)\b',  
+        r'\b(temple|agung|bali|hindus|pura)\b', 
+        r'\b(peninsula|unification|north|korea|peace|advisory)\b',  
+        r'\b(asean|mekong|excellencies|region|indopacific)\b',  
+        r'\b(mercosur|paraguay|integration|uruguay|kirchner)\b', 
+        r'\b(argentines|buenos|aires|truth|works)\b',  
+        r'\b(rio|janeiro|cabral|eduardo)\b',  
+        r'\b(ilbo|residents|gangwondo|local|gwangju)\b',  
+        
+        # Institution/Agency-Specific
+        r'\b(kpk|prosecution|investigation|cbi|anticorruption)\b',  
+        r'\b(bnpb|damage|reconstruction|evacuation)\b',  
+        r'\b(iit|iits|university|students|drdo|manchester)\b', 
+        r'\b(secretarygeneral|excellencies)\b', 
+        
+        # Event/Summit-Focused (high-ranking)
+        r'\b(g20|g7|summit|financial|crisis|global)\b', 
+        r'\b(sports|athletes|olympics|games|winter|players)\b', 
+        r'\b(disaster|disasters|earthquake|emergency|spread)\b', 
+        
+        # Conversational/Informal (high-ranking)
+        r'\b(folks|weve|theyre|youre|audience|jobs|im)\b',  
+        
+        # Specific noisy combinations that ranked high
+        r'\b(god|guedes|federal|army|wonderful)\b',  
+        r'\b(party|remain|unity|certain|housing)\b',  
+        r'\b(dam|regency|water)\b',  
+        r'\b(toll|road|airport|sumatra|inaugurate)\b', 
+        r'\b(quarantine|covid19|confirmed|careful|ppkm)\b',  
+        r'\b(certificate|certificates|land)\b', 
+        r'\b(independence|movement|provisional|march|activists|1942|freedom)\b',  
+        r'\b(hunger|poverty|food|2004)\b',  
+        r'\b(buddhism|buddha|teachings|monk|monks|temple|fdi)\b', 
+    ]
+    for pattern in noise_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+    # Remove named entities: NORP, FAC, GPE, LOC
+    doc = nlp(text)
+    spans_to_remove = [ent.text for ent in doc.ents if ent.label_ in {'NORP', 'FAC', 'GPE', 'LOC'}]
+    for span in spans_to_remove:
+        text = text.replace(span, '')
+
+    return text.strip()
+
+# Process documents
+pres_docs = [clean_text(speech["content"]) for speech in tqdm(pres_data, desc="Cleaning Presidential")]
+parl_docs = [clean_text(speech["content"]) for speech in tqdm(parl_data, desc="Cleaning Parliamentary")]
+
+def safe_extract_year(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").year
+    except:
+        return None
+
+pres_years = [safe_extract_year(s.get("date", "")) for s in pres_data]
+parl_years = [safe_extract_year(s.get("date", "")) for s in parl_data]
+
+docs = pres_docs + parl_docs
+classes = ["Presidential"] * len(pres_docs) + ["Parliamentary"] * len(parl_docs)
+years = pres_years + parl_years
+
+# Custom stop words
+custom_stop_words = [
+    'hon', 'ble', 'mr', 'mrs', 'ms', 'speaker', 'madam', 'sir', 'thank', 'thanks',
+    'going', 'come', 'came', 'go', 'went', 'said', 'say', 'says', 'telling', 'told',
+    'think', 'thought', 'know', 'knew', 'see', 'saw', 'look', 'looked', 'want', 'wanted',
+    'need', 'needed', 'time', 'times', 'way', 'ways', 'make', 'made', 'take', 'taken',
+    'get', 'got', 'give', 'given', 'work', 'worked', 'working', 'help', 'helped',
+    'order', 'question', 'questions', 'motion', 'bill', 'act', 'clause', 'section',
+    'amendment', 'debate', 'discussion', 'vote', 'voting', 'member', 'members',
+    'honourable', 'minister', 'deputy', 'prime', 'president', 'vice', 'excellency'
+]
+
+# Vectorizer configuration
+vectorizer_model = CountVectorizer(
+    stop_words=list(set(list(CountVectorizer(stop_words='english').get_stop_words()) + custom_stop_words)),
+    min_df=10,
+    max_df=0.95
+)
+
+# UMAP model with random state for reproducibility
+umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine', random_state=RANDOM_SEED)
+
+# Fit BERTopic
+topic_model = BERTopic(
+    verbose=True, 
+    calculate_probabilities=True, 
+    vectorizer_model=vectorizer_model, 
+    umap_model=umap_model
+)
+topics, probs = topic_model.fit_transform(docs)
+
+# Get topics per class - ALL TOPICS
+topics_per_class = topic_model.topics_per_class(docs, classes=classes)
+
+print(f"\nALL TOPICS DISCOVERED:")
+print(f"Total topics found: {len(topics_per_class['Topic'].unique())} (including outliers)")
+
+# Save ALL Topics Per Class with Weight
+topics_pc_df = topics_per_class.copy()
+topics_pc_df["Weight%"] = topics_pc_df.groupby("Class")["Frequency"].transform(lambda x: x / x.sum() * 100)
+topics_pc_df.to_csv("topic_weight_by_system.csv", index=False)
+print("Saved topic_weight_by_system.csv")
+
+# Save Per-Speech Topic Assignment and Probability - KEEP ALL SPEECHES
+speech_topic_df = pd.DataFrame({
+    "speech_id": list(range(1, len(docs) + 1)),
+    "system": classes,
+    "dominant_topic": topics,
+    "dominant_topic_prob": [float(p) if isinstance(p, (float, int)) else (max(p) if p is not None and len(p) > 0 else 0.0) for p in probs],
+    "year": years
+})
+
+# Keep ALL speeches - only year filtering for complete probability data
+speech_topic_df = speech_topic_df[(speech_topic_df["year"] >= 2000) & (speech_topic_df["year"] <= 2025)]
+speech_topic_df.to_csv("speech_topic_mapping_with_probs.csv", index=False)
+print("Saved speech_topic_mapping_with_probs.csv")
+
+# Topic Distributions Over Time - ALL TOPICS
+topic_over_time_data = []
+
+for system in ["Presidential", "Parliamentary"]:
+    system_df = speech_topic_df[speech_topic_df.system == system]
+    
+    if not system_df.empty:  # Only proceed if we have data
+        grouped = system_df.groupby(["year", "dominant_topic"]).size().reset_index(name="count")
+        totals = system_df.groupby("year").size().reset_index(name="total")
+        merged = pd.merge(grouped, totals, on="year")
+        merged["proportion"] = merged["count"] / merged["total"]
+        merged["system"] = system
+        topic_over_time_data.append(merged)
+
+if topic_over_time_data:  # Only create if we have data
+    final_topic_trends = pd.concat(topic_over_time_data)
+    final_topic_trends.to_csv("topic_distributions_over_time.csv", index=False)
+    print("Saved topic_distributions_over_time.csv")
+
+print("Processing complete.")
+
+from google.colab import files
+files.download('speech_topic_mapping_with_probs.csv')
+files.download('topic_weight_by_system.csv')
+files.download('topic_distributions_over_time.csv')
